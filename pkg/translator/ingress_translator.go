@@ -10,6 +10,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	extsv1beta1 "k8s.io/api/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/tools/record"
 
 	dklbcache "github.com/mesosphere/dklb/pkg/cache"
 	"github.com/mesosphere/dklb/pkg/constants"
@@ -34,10 +36,12 @@ type IngressTranslator struct {
 	manager manager.EdgeLBManager
 	// logger is the logger to use when performing translation.
 	logger *log.Entry
+	// recorder is the event recorder to use for reporting events.
+	recorder record.EventRecorder
 }
 
 // NewIngressTranslator returns an ingress translator that can be used to translate the specified Ingress resource into an EdgeLB pool.
-func NewIngressTranslator(clusterName string, ingress *extsv1beta1.Ingress, options IngressTranslationOptions, kubeCache dklbcache.KubernetesResourceCache, manager manager.EdgeLBManager) *IngressTranslator {
+func NewIngressTranslator(clusterName string, ingress *extsv1beta1.Ingress, options IngressTranslationOptions, kubeCache dklbcache.KubernetesResourceCache, manager manager.EdgeLBManager, er record.EventRecorder) *IngressTranslator {
 	return &IngressTranslator{
 		clusterName: clusterName,
 		ingress:     ingress,
@@ -45,6 +49,7 @@ func NewIngressTranslator(clusterName string, ingress *extsv1beta1.Ingress, opti
 		kubeCache:   kubeCache,
 		manager:     manager,
 		logger:      log.WithField("ingress", kubernetesutil.Key(ingress)),
+		recorder:    er,
 	}
 }
 
@@ -94,41 +99,41 @@ func (it *IngressTranslator) computeIngressBackendNodePortMap() (IngressBackendN
 	res := make(IngressBackendNodePortMap, len(backends))
 	// Iterate over the set of Ingress backends, computing the target node port.
 	for _, backend := range backends {
-		if nodePort, err := it.computeNodePortForIngressBackend(backend); err == nil {
-			res[backend] = nodePort
-		} else {
-			return nil, err
+		// Check whether the Service resource referenced by the backend exists.
+		s, err := it.kubeCache.GetService(it.ingress.Namespace, backend.ServiceName)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				// The referenced Service resource does not exist.
+				// This may be caused by an error in the Ingress resource's spec, or by the fact that the Ingress and its referenced Service resources are in the process of being deleted.
+				// Hence, we log a warning but avoid failing, as failing would prevent the EdgeLB pool from being deleted in the latter scenario.
+				it.recorder.Eventf(it.ingress, corev1.EventTypeWarning, constants.ReasonBackendServiceNotFound, "service %q does not exist", backend.ServiceName)
+				log.Warnf("service %q referenced by ingress %q does not exist", backend.ServiceName, kubernetesutil.Key(it.ingress))
+				continue
+			}
+			// We've failed to read the referenced Service resource, so we should just fail.
+			return nil, fmt.Errorf("failed to read service %q referenced by ingress %q: %v", backend.ServiceName, kubernetesutil.Key(it.ingress), err)
 		}
+		// Check whether the referenced Service resource is of type "NodePort" or "LoadBalancer".
+		if s.Spec.Type != corev1.ServiceTypeNodePort && s.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			return nil, fmt.Errorf("service %q referenced by ingress %q is of unexpected type %q", backend.ServiceName, kubernetesutil.Key(it.ingress), s.Spec.Type)
+		}
+		// Lookup the referenced service port.
+		var servicePort *corev1.ServicePort
+		for _, port := range s.Spec.Ports {
+			// Pin "port" so we can take its address.
+			port := port
+			if port.Port == backend.ServicePort.IntVal || port.Name == backend.ServicePort.StrVal {
+				servicePort = &port
+			}
+		}
+		// Check whether the referenced service port has been found.
+		if servicePort == nil {
+			return nil, fmt.Errorf("port %q of service %q referenced by ingress %q not found", backend.ServicePort.String(), backend.ServiceName, kubernetesutil.Key(it.ingress))
+		}
+		res[backend] = servicePort.NodePort
 	}
 	// Return the populated map.
 	return res, nil
-}
-
-// computeNodePortForIngressBackend computes the node port targeted by the specified Ingress backend.
-func (it *IngressTranslator) computeNodePortForIngressBackend(backend extsv1beta1.IngressBackend) (int32, error) {
-	// Check whether the referenced Service resource exists.
-	s, err := it.kubeCache.GetService(it.ingress.Namespace, backend.ServiceName)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read service %q referenced by ingress %q: %v", backend.ServiceName, kubernetesutil.Key(it.ingress), err)
-	}
-	// Check whether the referenced Service resource is of type "NodePort" or "LoadBalancer".
-	if s.Spec.Type != corev1.ServiceTypeNodePort && s.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		return 0, fmt.Errorf("service %q referenced by ingress %q is of unexpected type %q", backend.ServiceName, kubernetesutil.Key(it.ingress), s.Spec.Type)
-	}
-	// Lookup the referenced service port.
-	var servicePort *corev1.ServicePort
-	for _, port := range s.Spec.Ports {
-		// Pin "port" so we can take its address.
-		port := port
-		if port.Port == backend.ServicePort.IntVal || port.Name == backend.ServicePort.StrVal {
-			servicePort = &port
-		}
-	}
-	// Check whether the referenced service port has been found.
-	if servicePort == nil {
-		return 0, fmt.Errorf("port %q of service %q referenced by ingress %q not found", backend.ServicePort.String(), backend.ServiceName, kubernetesutil.Key(it.ingress))
-	}
-	return servicePort.NodePort, nil
 }
 
 // createEdgeLBPool makes a decision on whether an EdgeLB pool should be created for the associated Ingress resource.
@@ -258,6 +263,8 @@ func (it *IngressTranslator) updateEdgeLBPoolObject(pool *models.V2Pool, backend
 	// updatedBackends holds the set of updated EdgeLB backends.
 	// It is used as the final set of EdgeLB backends for the EdgeLB pool if we find out we need to update it.
 	updatedBackends := make([]*models.V2Backend, 0, len(pool.Haproxy.Backends))
+	// ownedBackendCount holds the number of EdgeLB backends in the EdgeLB pool that are owned by the current Ingress resource.
+	ownedBackendCount := 0
 
 	// Iterate over the EdgeLB pool's EdgeLB backends and check whether each one is owned by the current Ingress.
 	// In case an EdgeLB backend isn't owned by the current Ingress, it is left unchanged and added to the set of "updated" EdgeLB backends.
@@ -283,12 +290,14 @@ func (it *IngressTranslator) updateEdgeLBPoolObject(pool *models.V2Pool, backend
 		currentIngressBackend := *backendMetadata.IngressBackend
 		if _, exists := backendMap[currentIngressBackend]; !exists {
 			wasChanged = true
-			report.Report("must delete edgelb backend %q as the corresponding ingress backend is missing from %q", backend.Name, kubernetesutil.Key(it.ingress))
+			report.Report("must delete edgelb backend %q as the corresponding ingress backend is missing", backend.Name)
 			continue
 		}
 		// At this point we know the Ingress backend corresponding to the current EdgeLB backend still exists.
 		// Mark the current Ingress backend as having been visited.
 		visitedIngressBackends[currentIngressBackend] = true
+		// Increment the counter of owned EdgeLB backends.
+		ownedBackendCount++
 		// Compute the desired state for the current EdgeLB backend.
 		// In case differences are detected, we replace  the existing EdgeLB backend with the computed one.
 		desiredBackend := computeEdgeLBBackendForIngressBackend(it.clusterName, it.ingress, currentIngressBackend, backendMap[currentIngressBackend])
@@ -300,6 +309,28 @@ func (it *IngressTranslator) updateEdgeLBPoolObject(pool *models.V2Pool, backend
 			updatedBackends = append(updatedBackends, backend)
 			report.Report("no changes required for backend %q", backend.Name)
 		}
+	}
+
+	// If the current Ingress resource still exists, we must add any missing Ingress backends to the list of updated backends.
+	if !ingressDeleted {
+		// Iterate over all desired Ingress backends in order to understand whether there are new ones.
+		// For every Ingress backend, if the corresponding EdgeLB backend is not present in the EdgeLB pool, we add it.
+		newBackends := make([]*models.V2Backend, 0)
+		for ingressBackend, nodePort := range backendMap {
+			if _, visited := visitedIngressBackends[ingressBackend]; !visited {
+				wasChanged = true
+				desiredBackend := computeEdgeLBBackendForIngressBackend(it.clusterName, it.ingress, ingressBackend, nodePort)
+				newBackends = append(newBackends, desiredBackend)
+				report.Report("must create backend %q", desiredBackend.Name)
+				// Increment the counter of owned Ingress backends.
+				ownedBackendCount++
+			}
+		}
+		// Sort new EdgeLB backends by their name before adding them to the EdgeLB pool in order to guarantee a predictable order.
+		sort.SliceStable(newBackends, func(i, j int) bool {
+			return newBackends[i].Name < newBackends[j].Name
+		})
+		updatedBackends = append(updatedBackends, newBackends...)
 	}
 
 	// frontendExists holds whether the EdgeLB frontend that corresponds to the current Ingress resource exists in the EdgeLB pool.
@@ -328,6 +359,12 @@ func (it *IngressTranslator) updateEdgeLBPoolObject(pool *models.V2Pool, backend
 			report.Report("must delete frontend %q as %q was deleted", frontend.Name, kubernetesutil.Key(it.ingress))
 			continue
 		}
+		// If there are no owned EdgeLB backends, we must remove the existing EdgeLB frontend as it would otherwise point at inexistent EdgeLB backends, causing an error.
+		if ownedBackendCount == 0 {
+			wasChanged = true
+			report.Report("must delete frontend %q as there are no owned backends", frontend.Name)
+			continue
+		}
 		// Mark the EdgeLB frontend as existing.
 		frontendExists = true
 		// Compute the desired state for the current EdgeLB frontend.
@@ -349,27 +386,10 @@ func (it *IngressTranslator) updateEdgeLBPoolObject(pool *models.V2Pool, backend
 	// Replace the EdgeLB pool's backends and frontends with the (possibly empty) updated lists.
 	pool.Haproxy.Backends, pool.Haproxy.Frontends = updatedBackends, updatedFrontends
 
-	// If the current Ingress resource was deleted, there is nothing else to do.
-	if ingressDeleted {
+	// If the current Ingress resource was deleted, or if there are no owned EdgeLB backends, there is nothing else to do.
+	if ingressDeleted || ownedBackendCount == 0 {
 		return wasChanged, report
 	}
-
-	// Iterate over all desired Ingress backends in order to understand whether there are new ones.
-	// For every Ingress backend, if the corresponding EdgeLB backend is not present in the EdgeLB pool, we add it.
-	newBackends := make([]*models.V2Backend, 0)
-	for ingressBackend, nodePort := range backendMap {
-		if _, visited := visitedIngressBackends[ingressBackend]; !visited {
-			wasChanged = true
-			desiredBackend := computeEdgeLBBackendForIngressBackend(it.clusterName, it.ingress, ingressBackend, nodePort)
-			newBackends = append(newBackends, desiredBackend)
-			report.Report("must create backend %q", desiredBackend.Name)
-		}
-	}
-	// Sort new EdgeLB backends by their name before adding them to the EdgeLB pool in order to guarantee a predictable order.
-	sort.SliceStable(newBackends, func(i, j int) bool {
-		return newBackends[i].Name < newBackends[j].Name
-	})
-	pool.Haproxy.Backends = append(pool.Haproxy.Backends, newBackends...)
 
 	// If the EdgeLB frontend for the current Ingress resource does not exist in the EdgeLB pool, create it now.
 	if !frontendExists {

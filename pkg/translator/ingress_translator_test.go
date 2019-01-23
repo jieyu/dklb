@@ -12,6 +12,7 @@ import (
 	extsv1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/mesosphere/dklb/pkg/constants"
 	dklberrors "github.com/mesosphere/dklb/pkg/errors"
@@ -173,7 +174,7 @@ func TestIngressTranslator_Translate(t *testing.T) {
 		m := new(edgelbmanagertestutil.MockEdgeLBManager)
 		test.mockCustomizer(m)
 		// Perform translation of the Ingress resource.
-		err := translator.NewIngressTranslator(testClusterName, test.ingress, test.options, k, m).Translate()
+		err := translator.NewIngressTranslator(testClusterName, test.ingress, test.options, k, m, record.NewFakeRecorder(10)).Translate()
 		if test.expectedError != nil {
 			// Make sure we've got the expected error.
 			assert.Equal(t, test.expectedError, err)

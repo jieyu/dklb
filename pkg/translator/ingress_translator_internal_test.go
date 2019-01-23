@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/mesosphere/dklb/pkg/constants"
 	"github.com/mesosphere/dklb/pkg/util/pointers"
@@ -185,17 +186,18 @@ var (
 
 func TestCreateEdgeLBPoolObjectForIngress(t *testing.T) {
 	tests := []struct {
-		description       string
-		resources         []runtime.Object
-		ingress           *extsv1beta1.Ingress
-		options           IngressTranslationOptions
-		expectedName      string
-		expectedRole      string
-		expectedCpus      float64
-		expectedMem       int32
-		expectedSize      int
-		expectedBackends  []*models.V2Backend
-		expectedFrontends []*models.V2Frontend
+		description        string
+		resources          []runtime.Object
+		ingress            *extsv1beta1.Ingress
+		options            IngressTranslationOptions
+		expectedName       string
+		expectedRole       string
+		expectedCpus       float64
+		expectedMem        int32
+		expectedSize       int
+		expectedBackends   []*models.V2Backend
+		expectedFrontends  []*models.V2Frontend
+		expectedEventCount int
 	}{
 		{
 			description: "create an edgelb pool based on valid translation options",
@@ -219,14 +221,39 @@ func TestCreateEdgeLBPoolObjectForIngress(t *testing.T) {
 			expectedFrontends: []*models.V2Frontend{
 				frontendForDummyIngress1,
 			},
+			expectedEventCount: 0,
+		},
+		{
+			description: "create an edgelb pool for an ingress for which a referrenced service resource is missing",
+			resources: []runtime.Object{
+				dummyIngress1BackendFoo,
+				dummyIngress1BackendBar,
+			},
+			ingress:      dummyIngress1,
+			options:      dummyIngress1TranslationOptions,
+			expectedName: "baz",
+			expectedRole: "custom_role",
+			expectedCpus: 5010.203,
+			expectedMem:  3724,
+			expectedSize: 3,
+			expectedBackends: []*models.V2Backend{
+				backendForDummyIngress1Bar,
+				defaultBackendForDummyIngress1,
+			},
+			expectedFrontends: []*models.V2Frontend{
+				frontendForDummyIngress1,
+			},
+			expectedEventCount: 1,
 		},
 	}
 	for _, test := range tests {
 		t.Logf("test case: %s", test.description)
 		// Create a mock KubernetesResourceCache.
 		kubeCache := cachetestutil.NewFakeKubernetesResourceCache(test.resources...)
+		// Create a fake event recorder.
+		recorder := record.NewFakeRecorder(10)
 		// Create a new instance of the Ingress translator.
-		translator := NewIngressTranslator(testClusterName, test.ingress, test.options, kubeCache, nil)
+		translator := NewIngressTranslator(testClusterName, test.ingress, test.options, kubeCache, nil, recorder)
 		// Compute the mapping between Ingress backends and Service node ports.
 		m, err := translator.computeIngressBackendNodePortMap()
 		// Make sure no error occurred.
@@ -241,6 +268,8 @@ func TestCreateEdgeLBPoolObjectForIngress(t *testing.T) {
 		assert.Equal(t, pointers.NewInt32(int32(test.expectedSize)), pool.Count)
 		assert.Equal(t, test.expectedBackends, pool.Haproxy.Backends)
 		assert.Equal(t, test.expectedFrontends, pool.Haproxy.Frontends)
+		// Make sure the expected number of events has been recorded.
+		assert.Equal(t, test.expectedEventCount, len(recorder.Events))
 	}
 }
 
@@ -255,6 +284,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 		expectedWasChanged bool
 		expectedBackends   []*models.V2Backend
 		expectedFrontends  []*models.V2Frontend
+		expectedEventCount int
 	}{
 		{
 			// Test that a pool that is in "in sync" with the Ingress resource's spec is detected as not requiring an update.
@@ -285,6 +315,28 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 			expectedFrontends: []*models.V2Frontend{
 				frontendForDummyIngress1,
 			},
+			expectedEventCount: 0,
+		},
+		{
+			// Test that a pool that is in "in sync" with the Ingress resource's spec is detected as requiring an update if the referenced Service resources are found missing.
+			description: "pool that is \"in sync\" with the Ingress resource's spec is detected as requiring an update if the referenced Service resources are found missing",
+			resources:   []runtime.Object{},
+			ingress:     dummyIngress1,
+			options:     dummyIngress1TranslationOptions,
+			pool: edgelbpooltestutil.DummyEdgeLBPool("baz", func(p *models.V2Pool) {
+				p.Haproxy.Backends = []*models.V2Backend{
+					backendForDummyIngress1Bar,
+					backendForDummyIngress1Baz,
+					defaultBackendForDummyIngress1,
+				}
+				p.Haproxy.Frontends = []*models.V2Frontend{
+					frontendForDummyIngress1,
+				}
+			}),
+			expectedWasChanged: true,
+			expectedBackends:   []*models.V2Backend{},
+			expectedFrontends:  []*models.V2Frontend{},
+			expectedEventCount: 3,
 		},
 		{
 			// Test that a pool that is in "in sync" with a deleted Ingress resource's spec is detected as requiring an update.
@@ -309,6 +361,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 			expectedWasChanged: true,
 			expectedBackends:   []*models.V2Backend{},
 			expectedFrontends:  []*models.V2Frontend{},
+			expectedEventCount: 0,
 		},
 		{
 			// Test that a pool for which a backend was manually changed is detected as requiring an update.
@@ -344,6 +397,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 			expectedFrontends: []*models.V2Frontend{
 				frontendForDummyIngress1,
 			},
+			expectedEventCount: 0,
 		},
 		{
 			// Test that a pool for which a frontend was manually changed is detected as requiring an update.
@@ -379,6 +433,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 			expectedFrontends: []*models.V2Frontend{
 				frontendForDummyIngress1,
 			},
+			expectedEventCount: 0,
 		},
 		{
 			// Test that a pool with existing backends/frontends but no backends/frontends for the current Ingress resource is detected as requiring an update, and has all expected backends and frontends after being updated in-place.
@@ -415,6 +470,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 				preExistingFrontend2,
 				frontendForDummyIngress1,
 			},
+			expectedEventCount: 0,
 		},
 		{
 			// Test that a pool that was "in sync" with an Ingress resource for which a backend was removed is detected as requiring an update.
@@ -455,14 +511,17 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 				preExistingFrontend1,
 				computeEdgeLBFrontendForIngress(testClusterName, dummyIngress1WithoutDummyIngress1BackendBaz, dummyIngress1TranslationOptions),
 			},
+			expectedEventCount: 0,
 		},
 	}
 	for _, test := range tests {
 		t.Logf("test case: %s", test.description)
 		// Create a mock KubernetesResourceCache.
 		kubeCache := cachetestutil.NewFakeKubernetesResourceCache(test.resources...)
+		// Create a fake event recorder.
+		recorder := record.NewFakeRecorder(10)
 		// Create a new instance of the Ingress translator.
-		translator := NewIngressTranslator(testClusterName, test.ingress, test.options, kubeCache, nil)
+		translator := NewIngressTranslator(testClusterName, test.ingress, test.options, kubeCache, nil, recorder)
 		// Compute the mapping between Ingress backends and Service node ports.
 		m, err := translator.computeIngressBackendNodePortMap()
 		// Make sure no error occurred.
@@ -475,5 +534,7 @@ func TestUpdateEdgeLBPoolObjectForIngress(t *testing.T) {
 		assert.Equal(t, test.expectedBackends, test.pool.Haproxy.Backends)
 		// Check that all expected frontends are present.
 		assert.Equal(t, test.expectedFrontends, test.pool.Haproxy.Frontends)
+		// Make sure the expected number of events has been recorded.
+		assert.Equal(t, test.expectedEventCount, len(recorder.Events))
 	}
 }

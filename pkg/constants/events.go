@@ -6,4 +6,6 @@ const (
 	// ReasonTranslationError is the reason used in Kubernetes events emitted due to failed translation of a Service/Ingress resource into an EdgeLB pool.
 	// TODO (@bcustodio) Understand if we should break this down into more fine-grained reasons (e.g. "InvalidSpec", "NetworkingError", ...).
 	ReasonTranslationError = "TranslationError"
+	// ReasonBackendServiceNotFound is the reason used in Kubernetes event emitted due to a missing Service resource referrenced by an Ingress resource.
+	ReasonBackendServiceNotFound = "BackendServiceNotFound"
 )
